@@ -25,8 +25,23 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 	"unicode"
+)
+
+type result struct {
+	res  int
+	file string
+	err  error
+}
+
+const (
+	SKIP = iota
+	OK
+	BAD
+	ERR
 )
 
 func main() {
@@ -34,26 +49,42 @@ func main() {
 		fmt.Println("Usage: hashcheck <file> [...]")
 		return
 	}
-	var sumOk, sumBad, sumSkip, sumErr int = 0, 0, 0, 0
-	for _, file := range os.Args[1:] {
-		exhash, err := extractHash(file)
-		if err != nil {
-			fmt.Printf("SKIP:  %s\n", file)
-			sumSkip++
-			continue
-		}
-		hash, err := hashFile(file)
-		if err != nil {
-			fmt.Printf("ERR:   %s (%v)\n", file, err)
-			sumErr++
-			continue
-		}
-		if hash == exhash {
-			fmt.Printf("OK:    %s\n", file)
-			sumOk++
-		} else {
-			fmt.Printf("BAD:   %s\n", file)
-			sumBad++
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	procs := runtime.GOMAXPROCS(0)
+	files := make(chan string)
+	results := make(chan result)
+	wg := new(sync.WaitGroup)
+	wg.Add(procs)
+	for i := 0; i < procs; i++ {
+		go hasher(files, results, wg)
+	}
+	go args(files, os.Args[1:])
+	done := make(chan bool)
+	go func() {
+		wg.Wait()
+		done <- true
+	}()
+	var sumOk, sumBad, sumSkip, sumErr int
+L1:
+	for {
+		select {
+		case r := <-results:
+			switch r.res {
+			case SKIP:
+				sumSkip++
+				fmt.Printf("SKIP: %s\n", r.file)
+			case OK:
+				sumOk++
+				fmt.Printf("OK:   %s\n", r.file)
+			case BAD:
+				sumBad++
+				fmt.Printf("BAD:  %s\n", r.file)
+			case ERR:
+				sumErr++
+				fmt.Printf("ERR:  %s: %v\n", r.file, r.err)
+			}
+		case _ = <-done:
+			break L1
 		}
 	}
 	if sumOk > 0 {
@@ -69,6 +100,34 @@ func main() {
 		fmt.Printf("[err: %d]", sumErr)
 	}
 	fmt.Println("")
+}
+
+func args(files chan<- string, filenames []string) {
+	for _, f := range filenames {
+		files <- f
+	}
+	close(files)
+}
+
+func hasher(files <-chan string, res chan<- result, wg *sync.WaitGroup) {
+	for file := range files {
+		expHash, err := extractHash(file)
+		if err != nil {
+			res <- result{SKIP, file, err}
+			continue
+		}
+		hash, err := hashFile(file)
+		if err != nil {
+			res <- result{ERR, file, err}
+			continue
+		}
+		if hash == expHash {
+			res <- result{OK, file, nil}
+		} else {
+			res <- result{BAD, file, nil}
+		}
+	}
+	wg.Done()
 }
 
 func extractHash(name string) (hash uint32, err error) {
